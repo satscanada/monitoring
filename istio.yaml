@@ -1,0 +1,18 @@
+http:
+- match:
+  - uri:
+      prefix: /grafana
+  route:
+  - destination:
+      host: monitoring-grafana.monitoring.svc.cluster.local
+      port:
+        number: 80
+
+- match:
+  - uri:
+      prefix: /prometheus
+  route:
+  - destination:
+      host: monitoring-kube-prometheus-prometheus.monitoring.svc.cluster.local
+      port:
+        number: 9090

@@ -1,0 +1,127 @@
+# =========================================================
+# Namespace (optional – create if not already present)
+# =========================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+---
+# =========================================================
+# Headless Service (required for StatefulSet identity)
+# This allows stable DNS like: influxdb-0.influxdb.monitoring.svc
+# =========================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: influxdb
+  namespace: monitoring
+spec:
+  clusterIP: None
+  selector:
+    app: influxdb
+  ports:
+    - name: http
+      port: 8086
+      targetPort: 8086
+---
+# =========================================================
+# ClusterIP Service (used by apps like K6, Grafana)
+# Access via: influxdb-svc.monitoring:8086
+# =========================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: influxdb-svc
+  namespace: monitoring
+spec:
+  type: ClusterIP
+  selector:
+    app: influxdb
+  ports:
+    - name: http
+      port: 8086
+      targetPort: 8086
+---
+# =========================================================
+# StatefulSet for InfluxDB
+# - Uses InfluxDB 1.12.4 Alpine image
+# - Automatically creates DB "k6" using env var
+# - Persistent storage via PVC
+# =========================================================
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: influxdb
+  namespace: monitoring
+spec:
+  serviceName: influxdb
+  replicas: 1
+  selector:
+    matchLabels:
+      app: influxdb
+
+  template:
+    metadata:
+      labels:
+        app: influxdb
+
+    spec:
+      containers:
+        - name: influxdb
+
+          # Lightweight Alpine-based image
+          image: influxdb:1.12.4-alpine
+
+          # Expose InfluxDB HTTP API
+          ports:
+            - name: http
+              containerPort: 8086
+
+          # Environment variables
+          env:
+            # Automatically creates database "k6" on startup
+            - name: INFLUXDB_DB
+              value: k6
+
+          # Mount persistent volume
+          volumeMounts:
+            - name: influxdb-data
+              mountPath: /var/lib/influxdb
+
+          # Optional resource limits (tune if needed)
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+          # Basic health checks
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: 8086
+            initialDelaySeconds: 30
+            periodSeconds: 10
+
+          readinessProbe:
+            httpGet:
+              path: /ping
+              port: 8086
+            initialDelaySeconds: 10
+            periodSeconds: 5
+
+  # =====================================================
+  # Persistent Volume Claim template
+  # Each pod gets its own volume (influxdb-0, etc.)
+  # =====================================================
+  volumeClaimTemplates:
+    - metadata:
+        name: influxdb-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 10Gi

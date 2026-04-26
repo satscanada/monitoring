@@ -1,0 +1,69 @@
+alertmanager:
+  enabled: false
+
+nodeExporter:
+  enabled: false
+
+defaultRules:
+  create: false
+
+kubeEtcd:
+  enabled: false
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeProxy:
+  enabled: false
+
+grafana:
+  enabled: true
+  adminPassword: admin123
+
+  service:
+    type: ClusterIP
+
+  grafana.ini:
+    server:
+      root_url: "%(protocol)s://%(domain)s/grafana/"
+      serve_from_sub_path: true
+
+  additionalDataSources:
+    - name: Prometheus-BasicAuth
+      type: prometheus
+      access: proxy
+      url: http://monitoring-kube-prometheus-prometheus.monitoring.svc:9090/prometheus
+      isDefault: true
+      basicAuth: true
+      basicAuthUser: promadmin
+      secureJsonData:
+        basicAuthPassword: promadmin123
+
+prometheus:
+  enabled: true
+  prometheusSpec:
+    replicas: 1
+    retention: 7d
+
+    externalUrl: /prometheus
+    routePrefix: /prometheus
+
+    webConfigFile: /etc/prometheus/web-config/web-config.yaml
+
+    secrets:
+      - prometheus-web-config
+
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 10Gi
+
+kubeStateMetrics:
+  enabled: true
+
+prometheusOperator:
+  enabled: true
