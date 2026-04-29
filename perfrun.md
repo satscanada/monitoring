@@ -5,22 +5,23 @@
 
 ## Table of Contents
 1. [Architecture Overview](#architecture-overview)
-2. [Node Layout](#node-layout)
-3. [JVM Tuning — lltm Server](#jvm-tuning--lltm-server)
-4. [JVM Tuning — lltm Client (Spring Boot)](#jvm-tuning--lltm-client-spring-boot)
-5. [FBP NATS Client — EDN Config Analysis](#fbp-nats-client--edn-config-analysis)
-6. [NATS Server Tuning](#nats-server-tuning)
-7. [Hikari Connection Pool Tuning](#hikari-connection-pool-tuning)
-8. [PostgreSQL Diagnostic Queries](#postgresql-diagnostic-queries)
-9. [PostgreSQL Tuning Guide](#postgresql-tuning-guide)
-10. [LMAX Disruptor](#lmax-disruptor)
-11. [Chronicle Queue + NVMe](#chronicle-queue--nvme)
-12. [Fastify Node.js Client](#fastify-nodejs-client-replacement)
-13. [k6 Load Test Configuration](#k6-load-test-configuration)
-14. [Kubernetes Resource Sizing](#kubernetes-resource-sizing)
-15. [Pre-Test Checklist](#pre-test-checklist)
-16. [Monitoring During Test](#monitoring-during-test)
-17. [Decision Tree — Sync vs Async DB Write](#decision-tree--sync-vs-async-db-write)
+2. [AZ Co-location — Confirmed + Lock In](#az-co-location--confirmed--lock-in)
+3. [Node Layout](#node-layout)
+4. [JVM Tuning — lltm Server](#jvm-tuning--lltm-server)
+5. [JVM Tuning — lltm Client (Spring Boot)](#jvm-tuning--lltm-client-spring-boot)
+6. [FBP NATS Client — EDN Config Analysis](#fbp-nats-client--edn-config-analysis)
+7. [NATS Server Tuning](#nats-server-tuning)
+8. [Hikari Connection Pool Tuning](#hikari-connection-pool-tuning)
+9. [PostgreSQL Diagnostic Queries](#postgresql-diagnostic-queries)
+10. [PostgreSQL Tuning Guide](#postgresql-tuning-guide)
+11. [LMAX Disruptor](#lmax-disruptor)
+12. [Chronicle Queue + NVMe](#chronicle-queue--nvme)
+13. [Fastify Node.js Client](#fastify-nodejs-client-replacement)
+14. [k6 Load Test Configuration](#k6-load-test-configuration)
+15. [Kubernetes Resource Sizing](#kubernetes-resource-sizing)
+16. [Pre-Test Checklist](#pre-test-checklist)
+17. [Monitoring During Test](#monitoring-during-test)
+18. [Decision Tree — Sync vs Async DB Write](#decision-tree--sync-vs-async-db-write)
 
 ---
 
@@ -48,9 +49,204 @@ lltm server pod (m6id.4xlarge — 8 CPU / 20 Gi)
 
 ---
 
+## AZ Co-location — Confirmed + Lock In
+
+### Confirmed Final Topology
+
+```
+eu-north-1a — Node 1 (m6id.4xlarge — NVMe SSD — TAINTED)
+  ├── lltm server    (taint keeps all other pods off this node)
+  └── nats           (taint keeps all other pods off this node)
+
+eu-north-1a — Node 2 (separate node, same AZ)
+  ├── lltm-client × 10
+  └── k6 × 10–15
+```
+
+This is the **ideal layout**:
+- Server + NATS share intra-node pod network (~0.05ms)
+- Client has dedicated CPU/RAM — no resource competition with server
+- k6 and client on same node is fine — different workload profiles
+- Taint on m6id node already prevents client/k6 from landing there
+
+---
+
+### Measured Network Latency
+
+```
+Client → NATS ping results:
+  mdev : 0.071ms   (extremely stable — no jitter)
+  max  : 0.555ms   (worst case single packet)
+  avg  : ~0.3ms    (estimated)
+
+Verdict: same AZ confirmed ✓
+         Cross-AZ would show max > 2ms — well within budget
+```
+
+### Latency Budget with Real Numbers
+
+```
+Client → NATS (measured, intra-AZ)       ~0.3ms  ✓
+NATS → Server (intra-node pod network)   ~0.05ms ✓
+FBP pipeline + server processing          ~?ms   ← measure via baseline run
+LMAX + Chronicle NVMe write              ~0.1ms  ✓
+Reply path                               ~0.3ms  ✓
+─────────────────────────────────────────────────
+Network overhead total                   ~0.75ms ✓
+
+Processing budget remaining:
+  At 350 VUs to hit 50K TPS:
+    Required avg latency = 350 / 50,000  = 7ms total
+    Network consumes                     = ~0.75ms
+    FBP + server processing budget       = 6.25ms ← must stay under this
+```
+
+### Why You Still Need Affinity on Client
+
+The taint on the m6id node protects server and NATS automatically. But without
+affinity on the client deployment, a pod restart could schedule client pods to
+`eu-north-1c` — adding 1–3ms cross-AZ latency silently.
+
+`nodeAffinity` on the client locks it to `eu-north-1a` permanently. No
+`podAffinity` needed — the taint handles node separation.
+
+> lltm server and NATS do **not** need affinity patches — the node taint
+> already guarantees they stay on the m6id.4xlarge in eu-north-1a.
+
+---
+
+### Step 1 — Confirm Current State
+
+```bash
+# Confirm taint on server node
+kubectl describe node <server-node> | grep -i taint
+
+# Check AZ of all nodes
+kubectl get nodes -o custom-columns=\
+"NAME:.metadata.name,\
+AZ:.metadata.labels.topology\.kubernetes\.io/zone,\
+TYPE:.metadata.labels.node\.kubernetes\.io/instance-type"
+
+# Confirm current pod placement
+kubectl get pods -o wide -n lltm | grep -E "lltm|nats|k6"
+```
+
+---
+
+### Step 2 — Apply nodeAffinity to Client and k6 Only
+
+```bash
+# ── lltm-client Deployment ──────────────────────────────────────
+kubectl patch deployment lltm-client -n lltm --type=merge -p '{
+  "spec": {
+    "template": {
+      "spec": {
+        "affinity": {
+          "nodeAffinity": {
+            "requiredDuringSchedulingIgnoredDuringExecution": {
+              "nodeSelectorTerms": [{
+                "matchExpressions": [{
+                  "key": "topology.kubernetes.io/zone",
+                  "operator": "In",
+                  "values": ["eu-north-1a"]
+                }]
+              }]
+            }
+          }
+        }
+      }
+    }
+  }
+}'
+
+# ── k6 Deployment ───────────────────────────────────────────────
+kubectl patch deployment k6 -n lltm --type=merge -p '{
+  "spec": {
+    "template": {
+      "spec": {
+        "affinity": {
+          "nodeAffinity": {
+            "requiredDuringSchedulingIgnoredDuringExecution": {
+              "nodeSelectorTerms": [{
+                "matchExpressions": [{
+                  "key": "topology.kubernetes.io/zone",
+                  "operator": "In",
+                  "values": ["eu-north-1a"]
+                }]
+              }]
+            }
+          }
+        }
+      }
+    }
+  }
+}'
+```
+
+---
+
+### Step 3 — Verify After Patch
+
+```bash
+# Confirm affinity set on client
+kubectl get pod -l app.kubernetes.io/name=lltm-client -n lltm \
+  -o jsonpath='{.items[0].spec.affinity}' | jq .
+
+# Confirm affinity set on k6
+kubectl get pod -l app=k6 -n lltm \
+  -o jsonpath='{.items[0].spec.affinity}' | jq .
+
+# Confirm all pods still in eu-north-1a after rollout
+kubectl get pods -o wide -n lltm | grep -E "lltm|nats|k6"
+# NODE column should all resolve to eu-north-1a nodes
+
+# Re-run ping to confirm latency unchanged after rollout
+kubectl exec -it lltm-client-<pod> -n lltm -- \
+  ping -c 100 <nats-pod-ip> | tail -3
+# Expect: mdev < 0.1ms, max < 1ms
+```
+
+---
+
+### Step 4 — Baseline Run Before Full Test
+
+With topology locked, run a low-VU baseline to measure actual FBP processing time:
+
+```javascript
+// baseline.js
+export const options = {
+  stages: [
+    { duration: '1m',  target: 50 },
+    { duration: '5m',  target: 50 },  // ← read avg latency here
+    { duration: '30s', target: 0  },
+  ],
+  thresholds: {
+    http_req_duration: ['p(50)<100', 'p(99)<500'],
+  },
+  discardResponseBodies: true,
+}
+```
+
+From k6 summary — use `http_req_duration avg`:
+
+```
+avg latency from k6   = end-to-end including network
+Subtract ~0.75ms      = actual FBP + server processing time
+
+VUs needed for 50K TPS = 50,000 × avg_total_latency_seconds
+
+Examples:
+  avg = 4ms  → VUs needed =  200  ✓ well within your 350
+  avg = 7ms  → VUs needed =  350  ✓ exactly your current config
+  avg = 10ms → VUs needed =  500  → scale k6 to 500 VUs across pods
+  avg = 15ms → VUs needed =  750  → 75 VUs per pod across 10 pods
+```
+
+---
+
 ## Node Layout
 
-### Server Node — m6id.4xlarge
+### Server Node — m6id.4xlarge (TAINTED — lltm + NATS only)
 
 | Resource | Total | lltm Server | NATS | kube-system | Free |
 |---|---|---|---|---|---|
@@ -59,24 +255,18 @@ lltm server pod (m6id.4xlarge — 8 CPU / 20 Gi)
 | NVMe | 2×474 GB | Chronicle | — | — | — |
 | Network | 12.5 Gbps | shared | shared | — | ~94% |
 
-### Client Node (separate)
+### Client Node (separate — eu-north-1a, affinity locked)
 
 | Component | Replicas | CPU Limit | RAM Limit |
 |---|---|---|---|
 | lltm-client | 10 | 4 | 4 Gi |
 | k6 | 10–15 | 4 | 4 Gi |
 
-> **Critical:** Client node and server node **must be in the same AWS Availability Zone.**  
-> Cross-AZ latency (~1–3ms) will prevent 50K TPS regardless of all other tuning.
-
 ```bash
-# Verify AZ placement
-kubectl get nodes -o custom-columns=\
-NAME:.metadata.name,\
-AZ:.metadata.labels."topology\.kubernetes\.io/zone"
-
-kubectl get pods -o wide | grep -E "lltm|nats|k6"
+# Verify node capacity available for client pods
+kubectl describe node <client-node> | grep -A10 "Allocated resources"
 ```
+
 
 ---
 
@@ -1107,10 +1297,15 @@ affinity:
 ## Pre-Test Checklist
 
 ```
+AZ Co-location
+✓ Confirmed same AZ — ping max 0.555ms, mdev 0.071ms
+□ Affinity patch applied to lltm-client, nats, lltm StatefulSet
+□ Pods verified still on same AZ nodes after patch rollout
+□ Baseline 50 VU run completed — FBP processing time measured
+
 Infrastructure
-□ Client and server pods confirmed in same AZ
 □ NVMe mount verified at /data/chronicle (not EBS)
-□ NATS pod on same node as server pod (not client node)
+□ NATS pod confirmed on same node as lltm server
 
 JVM — Server
 □ _JAVA_OPTIONS applied and verified (jcmd check)
@@ -1231,20 +1426,21 @@ Does NATS reply wait for PostgreSQL commit?
 
 | Priority | Change | Impact |
 |---|---|---|
-| 1 | Confirm client + server in **same AZ** | Eliminates 1–3ms cross-AZ penalty |
-| 2 | Extend k6 test to **18 min with 5 min steady state** | Get real measurements not warmup noise |
-| 3 | Apply server `_JAVA_OPTIONS` with `Xms2g Xmx16g` | Fixes LMAX startup + GC headroom |
-| 4 | Reduce FBP **req-timeout 5→2, fetch-expiry 10→4** in EDN | Prevents backpressure cascade at scale |
-| 5 | Update **nats.conf** — socket buffers 4MB + max_pending 128MB | Compensates for library-locked client buffers |
-| 6 | Bump NATS memory limit to **8Gi** | Prevents NATS becoming bottleneck |
-| 7 | Check sync vs async DB write path | Determines if 50K TPS is architecturally possible |
-| 8 | Set Hikari pool size per formula | Prevents DB connection exhaustion |
-| 9 | Add `tracePinnedThreads` temporarily to both pods | Finds hidden virtual thread pinning |
-| 10 | Run PostgreSQL diagnostic queries during test | Locate actual DB ceiling |
-| 11 | Monitor `ss -tmi` for TCP retransmits on client pod | Detect library socket buffer saturation |
-| 12 | Ask library team to expose `:socket-send-buffer-size` | Unlocks single biggest remaining tuning lever |
-| 13 | Ask library team to expose `:reconnect-wait-ms` | Improves pod restart recovery time |
-| 14 | Replace Spring Boot client with Fastify | 3–5x client throughput — bypasses library constraint entirely |
+| 1 | **AZ co-location confirmed** (0.555ms max) — apply affinity patch to lock it | Prevents cross-AZ regression after pod restart |
+| 2 | Run **baseline k6 at 50 VUs** to measure FBP processing time | Determines exact VU count needed for 50K TPS |
+| 3 | Extend full k6 test to **18 min with 5 min steady state** | Get real measurements not warmup noise |
+| 4 | Apply server `_JAVA_OPTIONS` with `Xms2g Xmx16g` | Fixes LMAX startup + GC headroom |
+| 5 | Reduce FBP **req-timeout 5→2, fetch-expiry 10→4** in EDN | Prevents backpressure cascade at scale |
+| 6 | Update **nats.conf** — socket buffers 4MB + max_pending 128MB | Compensates for library-locked client buffers |
+| 7 | Bump NATS memory limit to **8Gi** | Prevents NATS becoming bottleneck |
+| 8 | Check sync vs async DB write path | Determines if 50K TPS is architecturally possible |
+| 9 | Set Hikari pool size per formula | Prevents DB connection exhaustion |
+| 10 | Add `tracePinnedThreads` temporarily to both pods | Finds hidden virtual thread pinning |
+| 11 | Run PostgreSQL diagnostic queries during test | Locate actual DB ceiling |
+| 12 | Monitor `ss -tmi` for TCP retransmits on client pod | Detect library socket buffer saturation |
+| 13 | Ask library team to expose `:socket-send-buffer-size` | Unlocks single biggest remaining tuning lever |
+| 14 | Ask library team to expose `:reconnect-wait-ms` | Improves pod restart recovery time |
+| 15 | Replace Spring Boot client with Fastify | 3–5x client throughput — bypasses library constraint entirely |
 
 ---
 
